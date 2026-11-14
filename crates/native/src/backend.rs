@@ -357,6 +357,11 @@ impl NativeBackend {
             for app in artcraft_launcher_core::hosted_catalog::apps().iter().filter(|a| platform.is_none_or(|p| a.runs_on(p.os))) {
                 report_partial(app, &shared, &paths, platform);
             }
+            // Local MCP state: which installed apps can be exposed + the unified bridge.
+            {
+                let _mcp = MCP_WORK.lock().unwrap_or_else(PoisonError::into_inner);
+                shared.emit(mcp_state(&shared));
+            }
             drop(busy);
         });
     }
@@ -567,17 +572,31 @@ impl NativeBackend {
         }
     }
 
+    /// What updating this launcher to the newer release takes, when this copy can replace itself
+    /// and the release has the file the update downloads. Otherwise the UI offers the download.
+    fn launcher_update_job(&self) -> Option<(crate::self_update::Install, Release, Platform)> {
+        let install = self.shared.self_install.get().cloned().flatten()?;
+        let platform = self.platform?;
+        let release = self.shared.launcher_release.lock().unwrap_or_else(PoisonError::into_inner).clone()?;
+        crate::self_update::installs_from(&install, &release, platform).then_some((install, release, platform))
+    }
+
     /// Downloads the newer launcher, puts it in place and asks the UI to quit so it can start.
     fn update_launcher(&self) {
         let id = LAUNCHER_ID.to_string();
-        let (Some(install), Some(platform)) = (self.shared.self_install.get().cloned().flatten(), self.platform) else {
+        let refuse = || {
             self.shared.emit(Event::JobFinished {
-                app: id,
+                app: id.clone(),
                 result: Err("this copy of ArtCraft Launcher can't update itself; download the new version instead".into()),
             });
-            return;
         };
-        let Some(release) = self.shared.launcher_release.lock().unwrap_or_else(PoisonError::into_inner).clone() else { return };
+        if self.shared.self_install.get().cloned().flatten().is_none() || self.platform.is_none() {
+            return refuse();
+        }
+        if self.shared.launcher_release.lock().unwrap_or_else(PoisonError::into_inner).is_none() {
+            return;
+        }
+        let Some((install, release, platform)) = self.launcher_update_job() else { return refuse() };
         let stop = Arc::new(Stop::default());
         {
             let mut jobs = self.shared.jobs.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1603,6 +1622,12 @@ impl Backend for NativeBackend {
                     self.check(true);
                 }
             }
+            cmd @ (Command::McpState | Command::McpSetAgents { .. } | Command::McpSetClient { .. } | Command::McpRestartClient { .. }) => {
+                // Detection can run package-manager queries for seconds (flatpak on Linux):
+                // never on the UI thread that sends commands.
+                let shared = self.shared.clone();
+                std::thread::spawn(move || run_mcp(&shared, cmd));
+            }
         }
     }
 
@@ -1621,7 +1646,7 @@ impl Backend for NativeBackend {
             Some(Os::Windows) => "Show in Explorer",
             _ => "Show in Files",
         };
-        Capabilities { manage_apps: true, reveal_label, self_update: self.shared.self_install.get().is_some_and(Option::is_some) }
+        Capabilities { manage_apps: true, reveal_label, self_update: self.launcher_update_job().is_some() }
     }
 
     fn platform(&self) -> Option<Platform> {
@@ -1635,6 +1660,44 @@ impl Backend for NativeBackend {
     fn now(&self) -> i64 {
         crate::now()
     }
+}
+
+/// The AI agents state, from a fresh detection of the installed apps.
+fn mcp_state(shared: &Shared) -> Event {
+    mcp_state_for(&detected_apps(shared))
+}
+
+/// [`mcp_state`] for apps already detected.
+fn mcp_state_for(detected: &[crate::agents::InstalledApp]) -> Event {
+    Event::Mcp { agents: crate::agents::state(detected) }
+}
+
+/// Serialises MCP commands and every publication of the MCP state, so a state read before a
+/// command can't arrive after that command's own (newer) state.
+static MCP_WORK: Mutex<()> = Mutex::new(());
+
+/// One AI agents command, on a worker thread: detection can run package-manager queries for
+/// seconds (flatpak on Linux). Commands run one at a time; the new state is sent when done.
+fn run_mcp(shared: &Shared, cmd: Command) {
+    let _guard = MCP_WORK.lock().unwrap_or_else(PoisonError::into_inner);
+    let apps = detected_apps(shared);
+    let result = match cmd {
+        Command::McpSetAgents { enabled } => crate::agents::set_enabled(enabled, &apps),
+        Command::McpSetClient { client, added } => crate::agents::set_client(client, added),
+        Command::McpRestartClient { client } => crate::agents::restart_client(client),
+        _ => Ok(()),
+    };
+    if let Err(message) = result {
+        shared.emit(Event::McpError { message });
+    }
+    shared.emit(mcp_state_for(&apps));
+}
+
+/// The installed apps with their CLIs, from a fresh detection snapshot.
+fn detected_apps(shared: &Shared) -> Vec<crate::agents::InstalledApp> {
+    let manifest = shared.manifest.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let snapshot = crate::detect::Snapshot::take();
+    crate::agents::installed_apps(&manifest, &snapshot)
 }
 
 #[cfg(test)]
@@ -2916,5 +2979,35 @@ mod tests {
             assert_eq!(claim.join().unwrap(), Err(CANCELLED.to_string()));
         });
         assert!(!restarting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_launcher_release_without_a_file_for_this_copy_is_offered_as_a_download() {
+        use crate::self_update::Install;
+        // ArtCraft Launcher v0.17.0's macOS file: the disk image only.
+        let name = "artcraft-launcher-0.17.0-macos-universal.dmg";
+        let release = Release {
+            assets: vec![Asset { name: name.into(), size: 1, url: format!("https://example.invalid/{name}"), sha256: None }],
+            ..Release::default()
+        };
+        let mac = Platform { os: Os::MacOs, arch: Arch::Arm64 };
+        for (install, updates) in
+            [(Install::MacApp("/Applications/ArtCraft Launcher.app".into()), true), (Install::Standalone("/tmp/artcraft-launcher".into()), false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut backend = backend(dir.path(), mac, None);
+            backend.shared.self_install.set(Some(install.clone())).unwrap();
+            *backend.shared.launcher_release.lock().unwrap() = Some(release.clone());
+            assert_eq!(backend.capabilities().self_update, updates, "{install:?}");
+            if !updates {
+                backend.update_launcher();
+                let events = backend.poll();
+                assert!(
+                    matches!(&events[..], [Event::JobFinished { app, result: Err(_) }] if app == LAUNCHER_ID),
+                    "it refuses without starting a download: {events:?}"
+                );
+                assert!(backend.shared.jobs.lock().unwrap().is_empty());
+            }
+        }
     }
 }
